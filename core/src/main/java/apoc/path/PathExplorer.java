@@ -153,6 +153,8 @@ public class PathExplorer {
 		List<Node> blacklistNodes = startToNodes(config.get("blacklistNodes"));
 		EnumMap<NodeFilter, List<Node>> nodeFilter = new EnumMap<>(NodeFilter.class);
 
+		double threshold = Util.toDouble(config.getOrDefault("threshold", 1));
+
 		if (endNodes != null && !endNodes.isEmpty()) {
 			nodeFilter.put(END_NODES, endNodes);
 		}
@@ -169,12 +171,43 @@ public class PathExplorer {
 			nodeFilter.put(BLACKLIST_NODES, blacklistNodes);
 		}
 
-		Stream<Path> results = explorePathPrivate(nodes, relationshipFilter, labelFilter, minLevel, maxLevel, bfs, getUniqueness(uniqueness), filterStartNode, limit, nodeFilter, sequence, beginSequenceAtStart);
-
-		if (optional) {
-			return optionalStream(results);
+		if (threshold == 1) {
+			Stream<Path> results = explorePathPrivate(nodes, relationshipFilter, labelFilter, minLevel, maxLevel, bfs, getUniqueness(uniqueness), filterStartNode, limit, nodeFilter, sequence, beginSequenceAtStart);
+			if (optional) {
+				return optionalStream(results);
+			} else {
+				return results;
+			}
 		} else {
-			return results;
+			Stream<Path> results = explorePathPrivate(nodes, relationshipFilter, labelFilter, minLevel, maxLevel, bfs, getUniqueness(uniqueness), filterStartNode, limit, nodeFilter, sequence, beginSequenceAtStart, threshold);
+			if (optional) {
+				return optionalStream(results);
+			} else {
+				return results;
+			}
+		}
+	}
+
+	private Stream<Path> explorePathPrivate(Iterable<Node> startNodes,
+											String pathFilter,
+											String labelFilter,
+											long minLevel,
+											long maxLevel,
+											boolean bfs,
+											Uniqueness uniqueness,
+											boolean filterStartNode,
+											long limit,
+											EnumMap<NodeFilter, List<Node>> nodeFilter,
+											String sequence,
+											boolean beginSequenceAtStart,
+											double threshold) {
+
+		Traverser traverser = traverse(tx.traversalDescription(), startNodes, pathFilter, labelFilter, minLevel, maxLevel, uniqueness,bfs,filterStartNode, nodeFilter, sequence, beginSequenceAtStart);
+
+		if (limit == -1) {
+			return Iterables.stream(traverser);
+		} else {
+			return Iterables.stream(traverser).limit(limit);
 		}
 	}
 
@@ -231,6 +264,87 @@ public class PathExplorer {
 									 EnumMap<NodeFilter, List<Node>> nodeFilter,
 									 String sequence,
 									 boolean beginSequenceAtStart) {
+		TraversalDescription td = traversalDescription;
+		// based on the pathFilter definition now the possible relationships and directions must be shown
+
+		td = bfs ? td.breadthFirst() : td.depthFirst();
+
+		// if `sequence` is present, it overrides `labelFilter` and `relationshipFilter`
+		if (sequence != null && !sequence.trim().isEmpty())	{
+			String[] sequenceSteps = sequence.split(",");
+			List<String> labelSequenceList = new ArrayList<>();
+			List<String> relSequenceList = new ArrayList<>();
+
+			for (int index = 0; index < sequenceSteps.length; index++) {
+				List<String> seq = (beginSequenceAtStart ? index : index - 1) % 2 == 0 ? labelSequenceList : relSequenceList;
+				seq.add(sequenceSteps[index]);
+			}
+
+			td = td.expand(new RelationshipSequenceExpander(relSequenceList, beginSequenceAtStart));
+			td = td.evaluator(new LabelSequenceEvaluator(labelSequenceList, filterStartNode, beginSequenceAtStart, (int) minLevel));
+		} else {
+			if (pathFilter != null && !pathFilter.trim().isEmpty()) {
+				td = td.expand(new RelationshipSequenceExpander(pathFilter.trim(), beginSequenceAtStart));
+			}
+
+			if (labelFilter != null && sequence == null && !labelFilter.trim().isEmpty()) {
+				td = td.evaluator(new LabelSequenceEvaluator(labelFilter.trim(), filterStartNode, beginSequenceAtStart, (int) minLevel));
+			}
+		}
+
+		if (minLevel != -1) td = td.evaluator(Evaluators.fromDepth((int) minLevel));
+		if (maxLevel != -1) td = td.evaluator(Evaluators.toDepth((int) maxLevel));
+
+
+		if (nodeFilter != null && !nodeFilter.isEmpty()) {
+			List<Node> endNodes = nodeFilter.getOrDefault(END_NODES, Collections.EMPTY_LIST);
+			List<Node> terminatorNodes = nodeFilter.getOrDefault(TERMINATOR_NODES, Collections.EMPTY_LIST);
+			List<Node> blacklistNodes = nodeFilter.getOrDefault(BLACKLIST_NODES, Collections.EMPTY_LIST);
+			List<Node> whitelistNodes;
+
+			if (nodeFilter.containsKey(WHITELIST_NODES)) {
+				// need to add to new list since we may need to add to it later
+				// encounter "can't add to abstractList" error if we don't do this
+				whitelistNodes = new ArrayList<>(nodeFilter.get(WHITELIST_NODES));
+			} else {
+				whitelistNodes = Collections.EMPTY_LIST;
+			}
+
+			if (!blacklistNodes.isEmpty()) {
+				td = td.evaluator(NodeEvaluators.blacklistNodeEvaluator(filterStartNode, (int) minLevel, blacklistNodes));
+			}
+
+			Evaluator endAndTerminatorNodeEvaluator = NodeEvaluators.endAndTerminatorNodeEvaluator(filterStartNode, (int) minLevel, endNodes, terminatorNodes);
+			if (endAndTerminatorNodeEvaluator != null) {
+				td = td.evaluator(endAndTerminatorNodeEvaluator);
+			}
+
+			if (!whitelistNodes.isEmpty()) {
+				// ensure endNodes and terminatorNodes are whitelisted
+				whitelistNodes.addAll(endNodes);
+				whitelistNodes.addAll(terminatorNodes);
+				td = td.evaluator(NodeEvaluators.whitelistNodeEvaluator(filterStartNode, (int) minLevel, whitelistNodes));
+			}
+		}
+
+		td = td.uniqueness(uniqueness); // this is how Cypher works !! Uniqueness.RELATIONSHIP_PATH
+		// uniqueness should be set as last on the TraversalDescription
+		return td.traverse(startNodes);
+	}
+
+	public static Traverser traverse(TraversalDescription traversalDescription,
+									Iterable<Node> startNodes,
+									String pathFilter,
+									String labelFilter,
+									long minLevel,
+									long maxLevel,
+									Uniqueness uniqueness,
+									boolean bfs,
+									boolean filterStartNode,
+									EnumMap<NodeFilter, List<Node>> nodeFilter,
+									String sequence,
+									boolean beginSequenceAtStart,
+									double threshold) {
 		TraversalDescription td = traversalDescription;
 		// based on the pathFilter definition now the possible relationships and directions must be shown
 
